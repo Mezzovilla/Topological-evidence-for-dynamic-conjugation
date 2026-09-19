@@ -84,6 +84,7 @@
 use std::cell::Cell;
 
 use itertools::Itertools;
+use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::OsRng;
 use rand::seq::SliceRandom;
@@ -1166,6 +1167,428 @@ pub fn robinson_turner_two_sample_test(
 }
 
 // ---------------------------------------------------------------------------
+// Topological signature comparison (higher-level two-cloud entry point)
+// ---------------------------------------------------------------------------
+
+/// Multiple-testing correction applied across the per-dimension p-values of
+/// [`topological_signature_test`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum MultipleTestingCorrection {
+    /// Report raw p-values unchanged.
+    None,
+    /// Holm step-down correction: sort ascending, scale rank-`r` p-value by
+    /// `m - r`, enforce monotonicity via cumulative maximum, cap at 1.0.
+    Holm,
+}
+
+/// Configuration for [`topological_signature_test`].
+///
+/// `homology_dimensions`, `n_samples`, and `max_edge_length` have no
+/// scientifically universal defaults; construct with
+/// [`TopologicalSignatureConfig::new`]. All fields shared with
+/// [`RobinsonTurnerConfig`] take the same documented defaults as
+/// [`RobinsonTurnerConfig::new`]; there is intentionally no [`Default`] impl.
+#[derive(Clone, Debug)]
+pub struct TopologicalSignatureConfig {
+    /// Requested homology degrees, tested in caller order; each must be
+    /// `<= 5` and the list must be nonempty without duplicates.
+    pub homology_dimensions: Vec<usize>,
+    /// Number of point clouds sampled (with replacement) per input; must be
+    /// `>= 2` because [`robinson_turner_two_sample_test`] requires groups of
+    /// at least two clouds.
+    pub n_samples: usize,
+    /// Point count of every sampled cloud; `None` reuses each input's own
+    /// `n_points` (X clouds get `x.n_points`, Y clouds get `y.n_points`).
+    pub sampled_cloud_size: Option<usize>,
+    /// Finite, strictly positive Rips truncation (max edge length).
+    pub max_edge_length: f64,
+    /// Diagram-distance order `p`.
+    pub diagram_distance: DiagramDistance,
+    /// Loss exponent `q in {1, 2}` (default 2 → `F_{p,2}`).
+    pub loss_q: u32,
+    /// Exact-enumeration guard on `C(N, n1)` (default 1,000,000).
+    pub max_exact_labelings: u128,
+    /// Monte-Carlo draw count `B` (default 9,999). Must be nonzero whenever
+    /// Monte Carlo is selected.
+    pub n_permutations: u64,
+    /// Inference method selection (default [`InferenceMethod::Auto`]).
+    pub method: InferenceMethod,
+    /// Optional `u64` root seed. If `None`, a seed is drawn from `OsRng` and
+    /// recorded in the result; the same seed and configuration reproduce the
+    /// same sampled clouds and results.
+    pub random_seed: Option<u64>,
+    /// Significance level in `(0, 1)` (default 0.05), applied to the
+    /// *adjusted* p-values.
+    pub alpha: f64,
+    /// Losses within this tolerance of the observed statistic count as ties
+    /// (default 1e-12).
+    pub tie_tolerance: f64,
+    /// Essential-class handling (default [`EssentialClassPolicy::Reject`]).
+    /// Almost always needs [`EssentialClassPolicy::Drop`] when `H_0` is among
+    /// the requested dimensions.
+    pub essential_class_policy: EssentialClassPolicy,
+    /// Correction applied across dimensions (default
+    /// [`MultipleTestingCorrection::Holm`]).
+    pub multiple_testing_correction: MultipleTestingCorrection,
+}
+
+impl TopologicalSignatureConfig {
+    /// Create a configuration with the three required scientific choices; all
+    /// other fields take the documented defaults shared with
+    /// [`RobinsonTurnerConfig::new`], plus `sampled_cloud_size = None` and
+    /// `multiple_testing_correction = Holm`.
+    pub fn new(homology_dimensions: Vec<usize>, n_samples: usize, max_edge_length: f64) -> Self {
+        Self {
+            homology_dimensions,
+            n_samples,
+            sampled_cloud_size: None,
+            max_edge_length,
+            diagram_distance: DiagramDistance::Wasserstein2,
+            loss_q: 2,
+            max_exact_labelings: 1_000_000,
+            n_permutations: 9_999,
+            method: InferenceMethod::Auto,
+            random_seed: None,
+            alpha: 0.05,
+            tie_tolerance: 1e-12,
+            essential_class_policy: EssentialClassPolicy::Reject,
+            multiple_testing_correction: MultipleTestingCorrection::Holm,
+        }
+    }
+}
+
+/// Result of [`topological_signature_test`].
+///
+/// `p_values`, `adjusted_p_values`, `reject_null`, and `dimension_results`
+/// are all aligned with `homology_dimensions` in caller order. `random_seed`
+/// is always recorded — even when every per-dimension test used exact
+/// inference — because sampling itself is random.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct TopologicalSignatureTestResult {
+    /// Raw per-dimension p-values, in caller dimension order.
+    pub p_values: Vec<f64>,
+    /// P-values after the selected multiple-testing correction, in caller
+    /// dimension order (equal to `p_values` under
+    /// [`MultipleTestingCorrection::None`]).
+    pub adjusted_p_values: Vec<f64>,
+    /// `adjusted_p_values[i] < alpha`, in caller dimension order.
+    pub reject_null: Vec<bool>,
+    /// Significance level used.
+    pub alpha: f64,
+    /// Requested homology degrees, in caller order.
+    pub homology_dimensions: Vec<usize>,
+    /// Multiple-testing correction applied.
+    pub multiple_testing_correction: MultipleTestingCorrection,
+    /// Root `u64` seed (supplied or `OsRng`-generated) from which every
+    /// sampling and per-dimension inference stream was derived.
+    pub random_seed: u64,
+    /// `(n_samples, n_samples)` — the two sampled group sizes.
+    pub sampled_group_sizes: (usize, usize),
+    /// Point count of each sampled cloud in group X and group Y.
+    pub sampled_point_counts: (usize, usize),
+    /// Full per-dimension [`RobinsonTurnerTestResult`]s, in caller order.
+    pub dimension_results: Vec<RobinsonTurnerTestResult>,
+    /// Mechanically derived interpretation sentence.
+    pub interpretation: String,
+}
+
+/// Error type for [`topological_signature_test`]. No variant is produced by a
+/// panic.
+#[derive(Debug, Error)]
+pub enum TopologicalSignatureError {
+    /// Invalid configuration field.
+    #[error("invalid topological-signature configuration: {0}")]
+    InvalidConfig(String),
+    /// One of the two input point clouds failed validation.
+    #[error("invalid topological-signature input: {0}")]
+    Input(#[source] RobinsonTurnerError),
+    /// The lower-level Robinson–Turner test failed for one dimension.
+    #[error("Robinson-Turner test failed: {0}")]
+    RobinsonTurner(#[source] RobinsonTurnerError),
+}
+
+// Fixed SplitMix64 domain constants: every random stream (X sampling, Y
+// sampling, and each dimension position's permutation stream) is derived
+// independently from the root seed, so no stream depends on how many random
+// values another stream consumed.
+const STREAM_SAMPLE_X: u64 = 0x585f_5341_4d50_4c45; // "X_SAMPLE"
+const STREAM_SAMPLE_Y: u64 = 0x595f_5341_4d50_4c45; // "Y_SAMPLE"
+const STREAM_DIMENSION_BASE: u64 = 0x4449_4d5f_0000_0000; // "DIM_" + position
+
+/// SplitMix64-style mixing of `root` with a fixed stream domain constant.
+fn derive_stream_seed(root: u64, domain: u64) -> u64 {
+    let mut z = root
+        .wrapping_add(domain)
+        .wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Draw `n_samples` clouds of `size` points each by uniform index sampling
+/// with replacement from `cloud`, driven by `ChaCha8Rng` seeded with `seed`.
+/// Row values and `ambient_dim` are preserved verbatim.
+fn sample_clouds(cloud: &PointCloud, n_samples: usize, size: usize, seed: u64) -> Vec<PointCloud> {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    (0..n_samples)
+        .map(|_| {
+            let mut coordinates = Vec::with_capacity(size * cloud.ambient_dim);
+            for _ in 0..size {
+                let i = rng.random_range(0..cloud.n_points);
+                let start = i * cloud.ambient_dim;
+                coordinates.extend_from_slice(&cloud.coordinates[start..start + cloud.ambient_dim]);
+            }
+            PointCloud {
+                coordinates,
+                n_points: size,
+                ambient_dim: cloud.ambient_dim,
+            }
+        })
+        .collect()
+}
+
+/// Apply the selected correction to the aligned per-dimension p-values and
+/// restore caller order.
+fn apply_multiple_testing_correction(
+    p_values: &[f64],
+    correction: MultipleTestingCorrection,
+) -> Vec<f64> {
+    match correction {
+        MultipleTestingCorrection::None => p_values.to_vec(),
+        MultipleTestingCorrection::Holm => {
+            let m = p_values.len();
+            let mut order: Vec<usize> = (0..m).collect();
+            order.sort_by(|&a, &b| p_values[a].total_cmp(&p_values[b]).then_with(|| a.cmp(&b)));
+            let mut adjusted = vec![0.0; m];
+            let mut running_max = 0.0f64;
+            for (r, &i) in order.iter().enumerate() {
+                let scaled = ((m - r) as f64 * p_values[i]).min(1.0);
+                running_max = running_max.max(scaled);
+                adjusted[i] = running_max;
+            }
+            adjusted
+        }
+    }
+}
+
+/// Compare the topological signatures induced by two observed point clouds
+/// `X` and `Y`.
+///
+/// `X` and `Y` are treated as two samples from two underlying data-generating
+/// distributions. `config.n_samples` clouds are drawn from each input by
+/// uniform point-index sampling *with replacement* (each sampled cloud has
+/// `config.sampled_cloud_size` points, or the corresponding input's own
+/// `n_points` when `None`). The two sampled groups are drawn **once** and
+/// reused for every requested homology dimension; for each dimension, in
+/// caller order, [`robinson_turner_two_sample_test`] is invoked on the same
+/// two groups with a deterministically derived per-dimension seed.
+///
+/// A single root `u64` seed (supplied via `config.random_seed` or drawn from
+/// `OsRng`) drives three independent SplitMix64-derived streams — X sampling,
+/// Y sampling, and one stream per dimension position — so no stream depends
+/// on how many values another consumed, and the same seed and configuration
+/// reproduce identical results. The root seed is always recorded in the
+/// result, even when every per-dimension test used exact inference.
+///
+/// Because one test runs per homology dimension, the raw p-values are
+/// corrected per `config.multiple_testing_correction` (Holm by default);
+/// `reject_null` is computed against the *adjusted* p-values.
+///
+/// A failure to reject is **not** evidence that the two topological
+/// distributions are equal; see `interpretation` in the result.
+pub fn topological_signature_test(
+    x: &PointCloud,
+    y: &PointCloud,
+    config: &TopologicalSignatureConfig,
+) -> Result<TopologicalSignatureTestResult, TopologicalSignatureError> {
+    // --- Input validation (before any sampling) ----------------------------
+    validate_cloud(x, 0).map_err(TopologicalSignatureError::Input)?;
+    validate_cloud(y, 1).map_err(TopologicalSignatureError::Input)?;
+    if x.ambient_dim != y.ambient_dim {
+        return Err(TopologicalSignatureError::Input(
+            RobinsonTurnerError::InconsistentDimension {
+                expected: x.ambient_dim,
+                index: 1,
+                got: y.ambient_dim,
+            },
+        ));
+    }
+
+    // --- Configuration validation (mirrors the lower-level scalar checks) --
+    let invalid = |msg: String| TopologicalSignatureError::InvalidConfig(msg);
+    if config.homology_dimensions.is_empty() {
+        return Err(invalid("homology_dimensions must be nonempty".to_string()));
+    }
+    for (i, &dim) in config.homology_dimensions.iter().enumerate() {
+        if dim > MAX_HOMOLOGY_DIM {
+            return Err(invalid(format!(
+                "homology dimension {dim} exceeds backend limit {MAX_HOMOLOGY_DIM} (filtration dim <= 6)"
+            )));
+        }
+        if config.homology_dimensions[..i].contains(&dim) {
+            return Err(invalid(format!(
+                "duplicate homology dimension {dim} in homology_dimensions"
+            )));
+        }
+    }
+    if config.n_samples < 2 {
+        return Err(invalid(format!(
+            "n_samples must be at least 2, got {}",
+            config.n_samples
+        )));
+    }
+    if config.sampled_cloud_size == Some(0) {
+        return Err(invalid(
+            "sampled_cloud_size must be nonzero when set".to_string(),
+        ));
+    }
+    if !config.max_edge_length.is_finite() || config.max_edge_length <= 0.0 {
+        return Err(invalid(format!(
+            "max_edge_length must be finite and strictly positive, got {}",
+            config.max_edge_length
+        )));
+    }
+    if config.loss_q != 1 && config.loss_q != 2 {
+        return Err(invalid(format!(
+            "loss_q must be 1 or 2, got {}",
+            config.loss_q
+        )));
+    }
+    if !config.alpha.is_finite() || config.alpha <= 0.0 || config.alpha >= 1.0 {
+        return Err(invalid(format!(
+            "alpha must be in (0, 1), got {}",
+            config.alpha
+        )));
+    }
+    if !config.tie_tolerance.is_finite() || config.tie_tolerance < 0.0 {
+        return Err(invalid(format!(
+            "tie_tolerance must be finite and nonnegative, got {}",
+            config.tie_tolerance
+        )));
+    }
+    if config.method == InferenceMethod::MonteCarlo && config.n_permutations == 0 {
+        return Err(invalid(
+            "n_permutations (B) must be nonzero for Monte-Carlo inference".to_string(),
+        ));
+    }
+
+    // --- Sampled-cloud capacity check (before seeding or sampling) ----------
+    let size_x = config.sampled_cloud_size.unwrap_or(x.n_points);
+    let size_y = config.sampled_cloud_size.unwrap_or(y.n_points);
+    for (size, ambient_dim) in [(size_x, x.ambient_dim), (size_y, y.ambient_dim)] {
+        let byte_len = size
+            .checked_mul(ambient_dim)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<f64>()));
+        match byte_len {
+            Some(bytes) if bytes <= isize::MAX as usize => {}
+            _ => {
+                return Err(invalid(format!(
+                    "sampled_cloud_size capacity overflow: {size} points x {ambient_dim} dims \
+                     is not representable as a coordinate buffer"
+                )));
+            }
+        }
+    }
+
+    // --- Root seed and independent derived streams --------------------------
+    let root_seed = match config.random_seed {
+        Some(s) => s,
+        None => {
+            // rand 0.9: OsRng implements `TryRngCore` (its OS call can
+            // fail); propagate instead of panicking.
+            use rand::rand_core::TryRngCore;
+            OsRng.try_next_u64().map_err(|e| {
+                TopologicalSignatureError::InvalidConfig(format!(
+                    "failed to draw a random seed from OsRng: {e}"
+                ))
+            })?
+        }
+    };
+
+    // --- Sampling: each group drawn once, reused across all dimensions ------
+    let group_a = sample_clouds(
+        x,
+        config.n_samples,
+        size_x,
+        derive_stream_seed(root_seed, STREAM_SAMPLE_X),
+    );
+    let group_b = sample_clouds(
+        y,
+        config.n_samples,
+        size_y,
+        derive_stream_seed(root_seed, STREAM_SAMPLE_Y),
+    );
+
+    // --- Per-dimension Robinson–Turner tests (caller order) -----------------
+    let mut p_values = Vec::with_capacity(config.homology_dimensions.len());
+    let mut dimension_results = Vec::with_capacity(config.homology_dimensions.len());
+    for (position, &dim) in config.homology_dimensions.iter().enumerate() {
+        let rt_config = RobinsonTurnerConfig {
+            homology_dim: dim,
+            max_edge_length: config.max_edge_length,
+            diagram_distance: config.diagram_distance,
+            loss_q: config.loss_q,
+            max_exact_labelings: config.max_exact_labelings,
+            n_permutations: config.n_permutations,
+            method: config.method,
+            random_seed: Some(derive_stream_seed(
+                root_seed,
+                STREAM_DIMENSION_BASE.wrapping_add(position as u64),
+            )),
+            alpha: config.alpha,
+            tie_tolerance: config.tie_tolerance,
+            essential_class_policy: config.essential_class_policy,
+            return_distance_matrix: false,
+        };
+        let result = robinson_turner_two_sample_test(&group_a, &group_b, &rt_config)
+            .map_err(TopologicalSignatureError::RobinsonTurner)?;
+        p_values.push(result.p_value);
+        dimension_results.push(result);
+    }
+
+    // --- Multiple-testing correction over aligned p-values ------------------
+    let adjusted_p_values =
+        apply_multiple_testing_correction(&p_values, config.multiple_testing_correction);
+    let reject_null: Vec<bool> = adjusted_p_values
+        .iter()
+        .map(|&p| p < config.alpha)
+        .collect();
+
+    let n_rejected = reject_null.iter().filter(|&&r| r).count();
+    let interpretation = if n_rejected > 0 {
+        format!(
+            "{n_rejected} of {} requested homology dimension(s) show evidence of differences \
+             between the topological distributions induced by X and Y under the configured \
+             sampling, filtration, metric, and statistical-test pipeline (alpha = {}).",
+            reject_null.len(),
+            config.alpha
+        )
+    } else {
+        format!(
+            "The procedure did not find sufficient evidence of differences between the \
+             topological distributions induced by X and Y under the configured sampling, \
+             filtration, metric, and statistical-test pipeline (alpha = {}); this is not \
+             proof that the distributions are equal.",
+            config.alpha
+        )
+    };
+
+    Ok(TopologicalSignatureTestResult {
+        p_values,
+        adjusted_p_values,
+        reject_null,
+        alpha: config.alpha,
+        homology_dimensions: config.homology_dimensions.clone(),
+        multiple_testing_correction: config.multiple_testing_correction,
+        random_seed: root_seed,
+        sampled_group_sizes: (config.n_samples, config.n_samples),
+        sampled_point_counts: (size_x, size_y),
+        dimension_results,
+        interpretation,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests (plan items 1-10; serde_json item 11 belongs to the tests shard)
 // ---------------------------------------------------------------------------
 
@@ -1567,5 +1990,256 @@ mod tests {
         }
         // Each upper-triangle pair computed exactly once.
         assert_eq!(__test_seams::pairwise_distance_calls(), n * (n - 1) / 2);
+    }
+
+    // --- Topological signature comparison ---------------------------------
+
+    /// Two small well-separated 2-D source clouds; `essential_class_policy`
+    /// is `Drop` in all signature tests so `H_0` essential components are
+    /// censored.
+    fn signature_inputs() -> (PointCloud, PointCloud) {
+        (
+            tiny_cloud(&[&[0.0, 0.0], &[0.1, 0.0], &[0.0, 0.1]]),
+            tiny_cloud(&[&[3.0, 3.0], &[3.1, 3.0], &[3.0, 3.1], &[3.1, 3.1]]),
+        )
+    }
+
+    fn signature_config(dims: &[usize]) -> TopologicalSignatureConfig {
+        let mut cfg = TopologicalSignatureConfig::new(dims.to_vec(), 2, 2.0);
+        cfg.essential_class_policy = EssentialClassPolicy::Drop;
+        cfg.method = InferenceMethod::Exact;
+        cfg.random_seed = Some(1234);
+        cfg
+    }
+
+    // Same seed → identical sampled groups and identical full results.
+    #[test]
+    fn signature_deterministic_bootstrap_repeatability() {
+        let (x, y) = signature_inputs();
+        let cfg = signature_config(&[0]);
+        let r1 = topological_signature_test(&x, &y, &cfg).unwrap();
+        let r2 = topological_signature_test(&x, &y, &cfg).unwrap();
+        assert_eq!(r1, r2);
+        // The derived sampling streams are themselves deterministic.
+        let a1 = sample_clouds(&x, 3, 5, derive_stream_seed(7, STREAM_SAMPLE_X));
+        let a2 = sample_clouds(&x, 3, 5, derive_stream_seed(7, STREAM_SAMPLE_X));
+        assert_eq!(a1, a2);
+        // X and Y streams differ.
+        let b = sample_clouds(&x, 3, 5, derive_stream_seed(7, STREAM_SAMPLE_Y));
+        assert_ne!(a1, b);
+    }
+
+    // Sampled rows always come from source rows, and a sampled_cloud_size
+    // larger than the source succeeds (sampling is with replacement).
+    #[test]
+    fn signature_sampling_rows_and_replacement() {
+        let (x, _y) = signature_inputs();
+        let sampled = sample_clouds(&x, 4, 10, 42);
+        assert_eq!(sampled.len(), 4);
+        let source_rows: Vec<&[f64]> = x.coordinates.chunks(x.ambient_dim).collect();
+        for cloud in &sampled {
+            assert_eq!(cloud.n_points, 10);
+            assert_eq!(cloud.ambient_dim, x.ambient_dim);
+            for row in cloud.coordinates.chunks(cloud.ambient_dim) {
+                assert!(source_rows.contains(&row), "row {row:?} not in source");
+            }
+        }
+        // Same through the public API: size larger than both inputs works.
+        let (_x, y) = signature_inputs();
+        let mut cfg = signature_config(&[0]);
+        cfg.sampled_cloud_size = Some(8);
+        let res = topological_signature_test(&_x, &y, &cfg).unwrap();
+        assert_eq!(res.sampled_point_counts, (8, 8));
+    }
+
+    // sampled_cloud_size = None gives per-input default sizes.
+    #[test]
+    fn signature_default_sampled_sizes() {
+        let (x, y) = signature_inputs();
+        let cfg = signature_config(&[0]);
+        assert_eq!(cfg.sampled_cloud_size, None);
+        let res = topological_signature_test(&x, &y, &cfg).unwrap();
+        assert_eq!(res.sampled_point_counts, (x.n_points, y.n_points));
+        assert_eq!(res.sampled_group_sizes, (2, 2));
+    }
+
+    // Run with no seed, then replay with the recorded seed → identical result.
+    #[test]
+    fn signature_root_seed_replay() {
+        let (x, y) = signature_inputs();
+        let mut cfg = signature_config(&[0, 1]);
+        cfg.random_seed = None;
+        let r1 = topological_signature_test(&x, &y, &cfg).unwrap();
+        cfg.random_seed = Some(r1.random_seed);
+        let r2 = topological_signature_test(&x, &y, &cfg).unwrap();
+        assert_eq!(r1, r2);
+        // Seed is recorded even though all tests used exact inference.
+        assert!(
+            r1.dimension_results
+                .iter()
+                .all(|d| d.inference_mode == InferenceMode::Exact)
+        );
+    }
+
+    // Dimensions stay aligned in caller order (request [1, 0]).
+    #[test]
+    fn signature_dimension_order_alignment() {
+        let (x, y) = signature_inputs();
+        let cfg = signature_config(&[1, 0]);
+        let res = topological_signature_test(&x, &y, &cfg).unwrap();
+        assert_eq!(res.homology_dimensions, vec![1, 0]);
+        assert_eq!(res.dimension_results.len(), 2);
+        assert_eq!(res.p_values.len(), 2);
+        assert_eq!(res.adjusted_p_values.len(), 2);
+        assert_eq!(res.reject_null.len(), 2);
+        for (i, &dim) in res.homology_dimensions.iter().enumerate() {
+            assert_eq!(res.dimension_results[i].homology_dim, dim);
+            assert_eq!(res.p_values[i], res.dimension_results[i].p_value);
+        }
+    }
+
+    // Holm step-down on a known vector; None is the identity.
+    #[test]
+    fn signature_holm_known_vector() {
+        let p = [0.01, 0.04, 0.03];
+        let adj = apply_multiple_testing_correction(&p, MultipleTestingCorrection::Holm);
+        assert_eq!(adj, vec![0.03, 0.06, 0.06]);
+        let identity = apply_multiple_testing_correction(&p, MultipleTestingCorrection::None);
+        assert_eq!(identity, p.to_vec());
+        // Cap at 1.0 and cumulative maximum.
+        let adj2 = apply_multiple_testing_correction(&[0.5, 0.5], MultipleTestingCorrection::Holm);
+        assert_eq!(adj2, vec![1.0, 1.0]);
+        let adj3 = apply_multiple_testing_correction(&[0.9, 0.02], MultipleTestingCorrection::Holm);
+        assert_eq!(adj3, vec![0.9, 0.04]);
+    }
+
+    // Invalid configurations and malformed/mismatched inputs produce the
+    // right structured errors.
+    #[test]
+    fn signature_validation_matrix() {
+        let (x, y) = signature_inputs();
+        let good = signature_config(&[0]);
+        // Empty / duplicate / out-of-range dimensions.
+        for dims in [vec![], vec![0, 0], vec![6], vec![0, 1, 1]] {
+            let mut bad = good.clone();
+            bad.homology_dimensions = dims;
+            assert!(matches!(
+                topological_signature_test(&x, &y, &bad),
+                Err(TopologicalSignatureError::InvalidConfig(_))
+            ));
+        }
+        // n_samples < 2.
+        let mut bad = good.clone();
+        bad.n_samples = 1;
+        assert!(matches!(
+            topological_signature_test(&x, &y, &bad),
+            Err(TopologicalSignatureError::InvalidConfig(_))
+        ));
+        // sampled_cloud_size = Some(0).
+        let mut bad = good.clone();
+        bad.sampled_cloud_size = Some(0);
+        assert!(matches!(
+            topological_signature_test(&x, &y, &bad),
+            Err(TopologicalSignatureError::InvalidConfig(_))
+        ));
+        // Mirrored scalar checks.
+        for v in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut bad = good.clone();
+            bad.max_edge_length = v;
+            assert!(matches!(
+                topological_signature_test(&x, &y, &bad),
+                Err(TopologicalSignatureError::InvalidConfig(_))
+            ));
+        }
+        let mut bad = good.clone();
+        bad.loss_q = 3;
+        assert!(matches!(
+            topological_signature_test(&x, &y, &bad),
+            Err(TopologicalSignatureError::InvalidConfig(_))
+        ));
+        let mut bad = good.clone();
+        bad.alpha = 1.5;
+        assert!(matches!(
+            topological_signature_test(&x, &y, &bad),
+            Err(TopologicalSignatureError::InvalidConfig(_))
+        ));
+        let mut bad = good.clone();
+        bad.tie_tolerance = -1.0;
+        assert!(matches!(
+            topological_signature_test(&x, &y, &bad),
+            Err(TopologicalSignatureError::InvalidConfig(_))
+        ));
+        let mut bad = good.clone();
+        bad.method = InferenceMethod::MonteCarlo;
+        bad.n_permutations = 0;
+        assert!(matches!(
+            topological_signature_test(&x, &y, &bad),
+            Err(TopologicalSignatureError::InvalidConfig(_))
+        ));
+        // Malformed x.
+        let ragged = PointCloud {
+            coordinates: vec![0.0, 0.0, 1.0],
+            n_points: 2,
+            ambient_dim: 2,
+        };
+        assert!(matches!(
+            topological_signature_test(&ragged, &y, &good),
+            Err(TopologicalSignatureError::Input(
+                RobinsonTurnerError::MalformedCloud { .. }
+            ))
+        ));
+        // Mismatched ambient dimensions.
+        let y3 = tiny_cloud(&[&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0]]);
+        assert!(matches!(
+            topological_signature_test(&x, &y3, &good),
+            Err(TopologicalSignatureError::Input(
+                RobinsonTurnerError::InconsistentDimension { .. }
+            ))
+        ));
+    }
+
+    // E1 regression: n_points * ambient_dim overflowing usize must surface as
+    // a structured malformed-cloud error, not a panic/wrap.
+    #[test]
+    fn signature_n_points_times_ambient_dim_overflow() {
+        let (_x, y) = signature_inputs();
+        let good = signature_config(&[0]);
+        let huge = PointCloud {
+            coordinates: vec![],
+            n_points: usize::MAX,
+            ambient_dim: 2,
+        };
+        let res = topological_signature_test(&huge, &y, &good);
+        assert!(
+            matches!(
+                res,
+                Err(TopologicalSignatureError::Input(
+                    RobinsonTurnerError::MalformedCloud { .. }
+                ))
+            ),
+            "expected Input(MalformedCloud), got {res:?}"
+        );
+        // Lower-level path rejects it too.
+        let c = || tiny_cloud(&[&[0.0, 0.0], &[1.0, 0.0]]);
+        let rt_cfg = RobinsonTurnerConfig::new(0, 2.0);
+        let res2 = robinson_turner_two_sample_test(&[huge, c()], &[c(), c()], &rt_cfg);
+        assert!(
+            matches!(res2, Err(RobinsonTurnerError::MalformedCloud { .. })),
+            "expected MalformedCloud, got {res2:?}"
+        );
+    }
+
+    // E2 regression: an unrepresentable sampled_cloud_size is rejected with
+    // InvalidConfig before any seeding/sampling, no panic.
+    #[test]
+    fn signature_sampled_cloud_size_capacity_overflow() {
+        let (x, y) = signature_inputs();
+        let mut bad = signature_config(&[0]);
+        bad.sampled_cloud_size = Some(usize::MAX);
+        let res = topological_signature_test(&x, &y, &bad);
+        assert!(
+            matches!(res, Err(TopologicalSignatureError::InvalidConfig(_))),
+            "expected InvalidConfig, got {res:?}"
+        );
     }
 }

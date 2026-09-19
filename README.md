@@ -60,6 +60,60 @@ println!("reject H0   = {}", result.reject_null);
 This example is mirrored and executed as an integration test in
 `tests/public_example.rs`.
 
+## Topological signature test
+
+`topological_signature_test` is a higher-level entry point for the common
+"one cloud per group" design: instead of supplying groups *of* clouds, you
+supply two input point clouds `X` and `Y`. The function draws `n_samples`
+sub-clouds from each input (uniformly, with replacement; `sampled_cloud_size`
+defaults to `None`, which keeps each source cloud's point count), then runs
+one Robinson–Turner test per requested homology dimension and reports raw and
+multiplicity-adjusted p-values.
+
+```rust
+use stattda::{
+    topological_signature_test, EssentialClassPolicy, InferenceMethod, PointCloud,
+    TopologicalSignatureConfig,
+};
+
+let x = PointCloud::try_from_rows(vec![
+    vec![1.0, 0.0], vec![0.5, 0.87], vec![-0.5, 0.87],
+    vec![-1.0, 0.0], vec![-0.5, -0.87], vec![0.5, -0.87],
+])
+.unwrap();
+let y = PointCloud::try_from_rows(vec![
+    vec![0.0, 0.0], vec![0.4, 0.0], vec![0.8, 0.0], vec![1.2, 0.0],
+])
+.unwrap();
+
+let mut config = TopologicalSignatureConfig::new(vec![0, 1], 8, 2.5);
+config.method = InferenceMethod::MonteCarlo;
+config.n_permutations = 999;
+config.random_seed = Some(42); // deterministic run; None uses OsRng
+// H0 keeps one essential component under a finite filtration: censor it.
+config.essential_class_policy = EssentialClassPolicy::Drop;
+
+let result = topological_signature_test(&x, &y, &config).expect("test failed");
+for ((&dim, &p), &adj) in result
+    .homology_dimensions
+    .iter()
+    .zip(&result.p_values)
+    .zip(&result.adjusted_p_values)
+{
+    println!("H{dim}: raw p = {p}, adjusted p = {adj}");
+}
+```
+
+*Interpretation.* There is one test per homology dimension in
+`homology_dimensions`; `p_values` holds the raw per-dimension p-values and
+`adjusted_p_values` holds them after `multiple_testing_correction`
+(`Holm` by default, `None` to opt out). A rejection at `alpha` is evidence of
+differences between the topological distributions induced by `X` and `Y`
+under the configured sampling / filtration / metric / test pipeline. It is
+*not* a claim about any individual feature, and **non-rejection is not proof
+that the two distributions are equal**. The `random_seed` used (given or
+generated) is recorded in the result; replaying it reproduces the full run.
+
 ## What the test claims (and what it does not)
 
 *Null hypothesis.* Conditional on the configured point-cloud-to-diagram

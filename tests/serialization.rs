@@ -9,7 +9,7 @@
 
 use stattda::{
     EssentialClassPolicy, InferenceMethod, PointCloud, RobinsonTurnerConfig,
-    robinson_turner_two_sample_test,
+    TopologicalSignatureConfig, robinson_turner_two_sample_test, topological_signature_test,
 };
 
 fn square(s: f64) -> PointCloud {
@@ -102,4 +102,40 @@ fn omitted_distance_matrix_serializes_per_documented_annotation() {
             "distance_matrix must be null when not returned, got {v}"
         ),
     }
+}
+
+#[test]
+fn signature_result_serializes_via_serde_json() {
+    let x = square(1.0);
+    let y =
+        PointCloud::try_from_rows(vec![vec![0.0, 0.0], vec![0.2, 0.0], vec![0.4, 0.0]]).unwrap();
+    let mut cfg = TopologicalSignatureConfig::new(vec![0], 2, 4.0);
+    cfg.method = InferenceMethod::Exact;
+    cfg.random_seed = Some(1);
+    cfg.essential_class_policy = EssentialClassPolicy::Drop;
+    let result = topological_signature_test(&x, &y, &cfg).unwrap();
+
+    let json = serde_json::to_string(&result).expect("signature result must serialize");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+    for key in [
+        "p_values",
+        "adjusted_p_values",
+        "reject_null",
+        "alpha",
+        "homology_dimensions",
+        "multiple_testing_correction",
+        "random_seed",
+        "sampled_group_sizes",
+        "sampled_point_counts",
+        "dimension_results",
+        "interpretation",
+    ] {
+        assert!(
+            value.get(key).is_some(),
+            "serialized signature result is missing key `{key}`: {json}"
+        );
+    }
+    assert_eq!(value["homology_dimensions"], serde_json::json!([0]));
+    assert!(value["dimension_results"].is_array());
 }
