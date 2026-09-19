@@ -490,13 +490,22 @@ fn validate_cloud(cloud: &PointCloud, index: usize) -> Result<(), RobinsonTurner
             reason: "cloud has no points".to_string(),
         });
     }
-    if cloud.coordinates.len() != cloud.n_points * cloud.ambient_dim {
+    let expected_len = match cloud.n_points.checked_mul(cloud.ambient_dim) {
+        Some(len) => len,
+        None => {
+            return Err(RobinsonTurnerError::MalformedCloud {
+                index,
+                reason: "n_points * ambient_dim overflows usize".to_string(),
+            });
+        }
+    };
+    if cloud.coordinates.len() != expected_len {
         return Err(RobinsonTurnerError::MalformedCloud {
             index,
             reason: format!(
                 "coordinates length {} != n_points * ambient_dim = {}",
                 cloud.coordinates.len(),
-                cloud.n_points * cloud.ambient_dim
+                expected_len
             ),
         });
     }
