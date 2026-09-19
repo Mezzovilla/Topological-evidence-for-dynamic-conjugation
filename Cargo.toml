@@ -1,0 +1,17 @@
+[package]
+name = "stattda"
+version = "0.1.0"
+edition = "2024"
+description = "Robinson-Turner two-sample permutation test on persistence diagrams"
+license = "Apache-2.0"
+
+[dependencies]
+oxicuda-tda = "=0.5.5"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+rand = "0.9"
+rand_chacha = "0.9"
+itertools = "0.14"
+
+[dev-dependencies]
+serde_json = "1"
