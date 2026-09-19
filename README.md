@@ -57,8 +57,20 @@ println!("p-value     = {}", result.p_value);
 println!("reject H0   = {}", result.reject_null);
 ```
 
+Expected output:
+
+```text
+F statistic = 0.020000000000000014
+p-value     = 0.089
+reject H0   = false
+```
+
 This example is mirrored and executed as an integration test in
-`tests/public_example.rs`.
+`tests/public_example.rs`. It is also runnable as a cargo example:
+
+```text
+cargo run --example public_example
+```
 
 ## Topological signature test
 
@@ -102,6 +114,19 @@ for ((&dim, &p), &adj) in result
 {
     println!("H{dim}: raw p = {p}, adjusted p = {adj}");
 }
+```
+
+Expected output:
+
+```text
+H0: raw p = 0.001, adjusted p = 0.002
+H1: raw p = 0.455, adjusted p = 0.455
+```
+
+This example is also runnable as a cargo example:
+
+```text
+cargo run --example compare_point_clouds
 ```
 
 *Interpretation.* There is one test per homology dimension in
