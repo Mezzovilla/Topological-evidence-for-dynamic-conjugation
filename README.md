@@ -82,7 +82,8 @@ supply two input point clouds `X` and `Y`. The function draws `n_samples`
 sub-clouds from each input (uniformly, with replacement; `sampled_cloud_size`
 defaults to `None`, which keeps each source cloud's point count), then runs
 one Robinson–Turner test per requested homology dimension and reports raw and
-multiplicity-adjusted p-values.
+multiplicity-adjusted p-values, plus a single global p-value that combines
+the per-dimension results.
 
 ```rust
 use stattda::{
@@ -117,6 +118,10 @@ for ((&dim, &p), &adj) in result
 {
     println!("H{dim}: raw p = {p}, adjusted p = {adj}");
 }
+println!(
+    "global p = {:.4}, reject null = {}",
+    result.global_p_value, result.global_reject_null
+);
 ```
 
 Expected output:
@@ -124,6 +129,7 @@ Expected output:
 ```text
 H0: raw p = 0.001, adjusted p = 0.002
 H1: raw p = 0.455, adjusted p = 0.455
+global p = 0.0020, reject null = true
 ```
 
 This example is also runnable as a cargo example:
@@ -135,12 +141,32 @@ cargo run --example compare_point_clouds
 *Interpretation.* There is one test per homology dimension in
 `homology_dimensions`; `p_values` holds the raw per-dimension p-values and
 `adjusted_p_values` holds them after `multiple_testing_correction`
-(`Holm` by default, `None` to opt out). A rejection at `alpha` is evidence of
-differences between the topological distributions induced by `X` and `Y`
-under the configured sampling / filtration / metric / test pipeline. It is
-*not* a claim about any individual feature, and **non-rejection is not proof
-that the two distributions are equal**. The `random_seed` used (given or
-generated) is recorded in the result; replaying it reproduces the full run.
+(`Holm` by default, `None` to opt out). Holm is a per-dimension
+compatibility output only — it is **not** the global test.
+
+The per-dimension tests are **dependent**: the same resampled groups are
+reused for every homology dimension and the underlying Vietoris–Rips
+complexes are shared. `global_p_value` therefore combines the raw p-values
+with `combination_method` — `CombinationMethod::Cauchy` by default, an
+analytic combination valid under arbitrary dependence. The global null `H0`
+is "the two topological distributions are equal in **every** requested
+dimension"; rejecting it (via `global_reject_null` at `alpha`) is evidence
+of a difference in **at least one** dimension. Reordering
+`homology_dimensions` does not change any per-dimension test or the global
+value: permutation streams are keyed by homology degree, not list position.
+
+A rejection at `alpha` is evidence of differences between the topological
+distributions induced by `X` and `Y` under the configured sampling /
+filtration / metric / test pipeline. It is *not* a claim about any
+individual feature, and **non-rejection is not proof that the two
+distributions are equal**. The `random_seed` used (given or generated) is
+recorded in the result; replaying it reproduces the full run.
+
+`CombinationMethod::HarmonicMean` currently returns a structured
+`TopologicalSignatureError::UnsupportedCombinationMethod` error because its
+Landau calibration was explicitly deferred;
+`CombinationMethod::JointPermutation` is likewise reserved pending shared
+permutations across dimensions.
 
 ## Synthetic manifold examples
 

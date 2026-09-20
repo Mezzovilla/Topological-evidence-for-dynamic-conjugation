@@ -189,6 +189,55 @@ fn readme_example_shape_compiles_and_succeeds() {
 }
 
 #[test]
+fn dimension_order_does_not_change_global_or_per_dimension_results() {
+    // Monte-Carlo runs with [0, 1] and [1, 0], same root seed and otherwise
+    // identical config: per-dimension permutation streams are keyed by the
+    // homology degree, so reordering the request changes only output order.
+    let (x, y) = (ring_cloud(), segment_cloud());
+    let mut cfg_ab = config(vec![0, 1], 4, Some(0x5EED));
+    cfg_ab.method = InferenceMethod::MonteCarlo;
+    cfg_ab.n_permutations = 99;
+    let mut cfg_ba = cfg_ab.clone();
+    cfg_ba.homology_dimensions = vec![1, 0];
+
+    let ab = topological_signature_test(&x, &y, &cfg_ab).unwrap();
+    let ba = topological_signature_test(&x, &y, &cfg_ba).unwrap();
+
+    // Global combination is order-invariant.
+    assert_eq!(ab.global_p_value, ba.global_p_value);
+    assert_eq!(ab.global_test_statistic, ba.global_test_statistic);
+    assert_eq!(ab.global_reject_null, ba.global_reject_null);
+    assert_eq!(ab.global_combination_method, ba.global_combination_method);
+
+    // Per-dimension results match after mapping by homology dimension.
+    for dim in [0usize, 1usize] {
+        let i = ab
+            .homology_dimensions
+            .iter()
+            .position(|&d| d == dim)
+            .unwrap();
+        let j = ba
+            .homology_dimensions
+            .iter()
+            .position(|&d| d == dim)
+            .unwrap();
+        assert_eq!(ab.p_values[i], ba.p_values[j], "dim {dim} raw p differs");
+        assert_eq!(
+            ab.adjusted_p_values[i], ba.adjusted_p_values[j],
+            "dim {dim} adjusted p differs"
+        );
+        assert_eq!(
+            ab.dimension_results[i].statistic, ba.dimension_results[j].statistic,
+            "dim {dim} statistic differs"
+        );
+        assert_eq!(
+            ab.dimension_results[i].p_value, ba.dimension_results[j].p_value,
+            "dim {dim} result p-value differs"
+        );
+    }
+}
+
+#[test]
 fn robinson_turner_two_sample_test_still_works_standalone() {
     // The lower-level primitive takes groups OF clouds directly.
     let group_a = vec![

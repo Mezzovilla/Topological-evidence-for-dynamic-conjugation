@@ -131,6 +131,10 @@ fn signature_result_serializes_via_serde_json() {
         "sampled_group_sizes",
         "sampled_point_counts",
         "dimension_results",
+        "global_p_value",
+        "global_reject_null",
+        "global_combination_method",
+        "global_test_statistic",
         "interpretation",
     ] {
         assert!(
@@ -139,5 +143,9 @@ fn signature_result_serializes_via_serde_json() {
         );
     }
     assert_eq!(value["homology_dimensions"], serde_json::json!([0]));
+    assert_eq!(
+        value["global_combination_method"],
+        serde_json::json!("Cauchy")
+    );
     assert!(value["dimension_results"].is_array());
 }

@@ -1240,6 +1240,36 @@ pub enum MultipleTestingCorrection {
     Holm,
 }
 
+/// Method used by [`topological_signature_test`] to combine the per-dimension
+/// p-values into one global p-value for the intersection null "the two clouds
+/// induce equal persistent-homology distributions in *every* requested
+/// dimension" (rejecting it means a difference in *at least one* dimension).
+///
+/// The per-dimension tests are **dependent**: the same resampled groups are
+/// reused for every dimension and the underlying Vietoris–Rips complexes are
+/// shared, so the combination method must be valid under arbitrary
+/// dependence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum CombinationMethod {
+    /// Cauchy combination (Liu & Xie, 2020): weighted sum of
+    /// `tan(π(0.5 - p_k))` transformed back through the Cauchy CDF. Valid
+    /// under arbitrary dependence between the p-values. This is the default
+    /// analytic global test.
+    Cauchy,
+    /// Harmonic-mean p-value (Wilson, 2019). **Reserved**: the Landau
+    /// calibration of the combined statistic was explicitly deferred, so
+    /// selecting this variant currently returns
+    /// [`TopologicalSignatureError::UnsupportedCombinationMethod`] rather
+    /// than an uncalibrated value.
+    HarmonicMean,
+    /// Joint permutation across dimensions (a single shared permutation
+    /// null for all dimensions). **Reserved**: it requires plumbing shared
+    /// permutations through the lower-level test, which was explicitly
+    /// deferred; selecting it returns
+    /// [`TopologicalSignatureError::UnsupportedCombinationMethod`].
+    JointPermutation,
+}
+
 /// Configuration for [`topological_signature_test`].
 ///
 /// `homology_dimensions` and `n_samples` have no
@@ -1293,15 +1323,33 @@ pub struct TopologicalSignatureConfig {
     pub essential_class_policy: EssentialClassPolicy,
     /// Correction applied across dimensions (default
     /// [`MultipleTestingCorrection::Holm`]).
+    ///
+    /// This is a **per-dimension compatibility output only**: the adjusted
+    /// p-values say which dimensions individually remain compatible with the
+    /// null. The global intersection-null decision is governed by
+    /// `combination_method`, not by this correction.
     pub multiple_testing_correction: MultipleTestingCorrection,
+    /// Method used to combine the per-dimension p-values into
+    /// [`TopologicalSignatureTestResult::global_p_value`] (default
+    /// [`CombinationMethod::Cauchy`]). The per-dimension tests are dependent
+    /// (shared resampled groups and shared Rips complexes), so only methods
+    /// valid under arbitrary dependence are offered.
+    pub combination_method: CombinationMethod,
+    /// Optional nonnegative weights for the global combination, aligned with
+    /// `homology_dimensions`. `None` (the default) uses uniform weights. When
+    /// set, the length must equal the number of requested dimensions, every
+    /// weight must be finite and nonnegative, and the total must be finite
+    /// and strictly positive; weights are normalized by their sum.
+    pub combination_weights: Option<Vec<f64>>,
 }
 
 impl TopologicalSignatureConfig {
     /// Create a configuration with the required scientific choices; the
     /// filtration cutoff defaults to `None` (automatic within-cloud diameter)
     /// and all other fields take the documented defaults shared with
-    /// [`RobinsonTurnerConfig::new`], plus `sampled_cloud_size = None` and
-    /// `multiple_testing_correction = Holm`.
+    /// [`RobinsonTurnerConfig::new`], plus `sampled_cloud_size = None`,
+    /// `multiple_testing_correction = Holm`, and
+    /// `combination_method = Cauchy` with `combination_weights = None`.
     pub fn new(homology_dimensions: Vec<usize>, n_samples: usize) -> Self {
         Self {
             homology_dimensions,
@@ -1318,6 +1366,8 @@ impl TopologicalSignatureConfig {
             tie_tolerance: 1e-12,
             essential_class_policy: EssentialClassPolicy::Reject,
             multiple_testing_correction: MultipleTestingCorrection::Holm,
+            combination_method: CombinationMethod::Cauchy,
+            combination_weights: None,
         }
     }
 }
@@ -1353,6 +1403,19 @@ pub struct TopologicalSignatureTestResult {
     pub sampled_point_counts: (usize, usize),
     /// Full per-dimension [`RobinsonTurnerTestResult`]s, in caller order.
     pub dimension_results: Vec<RobinsonTurnerTestResult>,
+    /// Combined global p-value for the intersection null "the two
+    /// distributions are equal in *every* requested homology dimension".
+    /// Rejecting it means evidence of a difference in *at least one*
+    /// dimension. Computed by `global_combination_method` from the raw
+    /// `p_values` (before the per-dimension multiple-testing correction).
+    pub global_p_value: f64,
+    /// `global_p_value <= alpha`.
+    pub global_reject_null: bool,
+    /// Combination method that produced `global_p_value`.
+    pub global_combination_method: CombinationMethod,
+    /// Observed value of the combination statistic (for Cauchy, the weighted
+    /// sum of `tan(π(0.5 - p_k))`), recorded for reproducibility/diagnosis.
+    pub global_test_statistic: f64,
     /// Mechanically derived interpretation sentence.
     pub interpretation: String,
 }
@@ -1370,15 +1433,21 @@ pub enum TopologicalSignatureError {
     /// The lower-level Robinson–Turner test failed for one dimension.
     #[error("Robinson-Turner test failed: {0}")]
     RobinsonTurner(#[source] RobinsonTurnerError),
+    /// The configured combination method is reserved but not implemented.
+    #[error("combination method {0:?} is not implemented")]
+    UnsupportedCombinationMethod(CombinationMethod),
 }
 
 // Fixed SplitMix64 domain constants: every random stream (X sampling, Y
-// sampling, and each dimension position's permutation stream) is derived
+// sampling, and each homology dimension's permutation stream) is derived
 // independently from the root seed, so no stream depends on how many random
-// values another stream consumed.
+// values another stream consumed. The dimension stream is keyed by the
+// homology degree itself — not by its position in `homology_dimensions` —
+// so reordering the requested dimensions cannot change any per-dimension
+// test or the combined global value.
 const STREAM_SAMPLE_X: u64 = 0x585f_5341_4d50_4c45; // "X_SAMPLE"
 const STREAM_SAMPLE_Y: u64 = 0x595f_5341_4d50_4c45; // "Y_SAMPLE"
-const STREAM_DIMENSION_BASE: u64 = 0x4449_4d5f_0000_0000; // "DIM_" + position
+const STREAM_DIMENSION_BASE: u64 = 0x4449_4d5f_0000_0000; // "DIM_" + homology degree
 
 /// SplitMix64-style mixing of `root` with a fixed stream domain constant.
 fn derive_stream_seed(root: u64, domain: u64) -> u64 {
@@ -1436,6 +1505,92 @@ fn apply_multiple_testing_correction(
     }
 }
 
+/// Combine per-dimension p-values into a single global p-value for the
+/// intersection null. Returns `(global_p_value, combination_statistic)`.
+///
+/// The p-values come from tests run on the *same* resampled groups, so they
+/// are arbitrarily dependent. [`CombinationMethod::Cauchy`] (Liu & Xie, 2020)
+/// is the implemented analytic method and is valid under arbitrary
+/// dependence:
+///
+/// `T = Σ wᵢ · tan(π(0.5 − pᵢ))`, `p_global = 0.5 − atan(T)/π`.
+///
+/// Each `pᵢ` is clamped to `[f64::EPSILON, 1 − f64::EPSILON]` so exact 0/1
+/// inputs stay finite and bounded. `weights` defaults to uniform; when
+/// supplied it must have the same length as `p_values`, be finite and
+/// nonnegative elementwise, and have a finite, strictly positive sum (it is
+/// normalized by that sum).
+///
+/// [`CombinationMethod::HarmonicMean`] is reserved pending the Landau
+/// calibration of the combined statistic (explicitly deferred), and
+/// [`CombinationMethod::JointPermutation`] is reserved pending shared
+/// permutations across dimensions; both return
+/// [`TopologicalSignatureError::UnsupportedCombinationMethod`] immediately.
+fn combine_p_values(
+    p_values: &[f64],
+    method: CombinationMethod,
+    weights: Option<&[f64]>,
+) -> Result<(f64, f64), TopologicalSignatureError> {
+    let invalid = |msg: String| TopologicalSignatureError::InvalidConfig(msg);
+    if p_values.is_empty() {
+        return Err(invalid("cannot combine an empty p-value set".to_string()));
+    }
+    match method {
+        CombinationMethod::HarmonicMean | CombinationMethod::JointPermutation => {
+            return Err(TopologicalSignatureError::UnsupportedCombinationMethod(
+                method,
+            ));
+        }
+        CombinationMethod::Cauchy => {}
+    }
+    for (i, &p) in p_values.iter().enumerate() {
+        if !p.is_finite() || !(0.0..=1.0).contains(&p) {
+            return Err(invalid(format!(
+                "p_values[{i}] must be finite and in [0, 1], got {p}"
+            )));
+        }
+    }
+    let m = p_values.len();
+    let normalized: Vec<f64> = match weights {
+        None => vec![1.0 / m as f64; m],
+        Some(w) => {
+            if w.len() != m {
+                return Err(invalid(format!(
+                    "combination_weights length {} must equal the number of p-values {m}",
+                    w.len()
+                )));
+            }
+            for (i, &wi) in w.iter().enumerate() {
+                if !wi.is_finite() || wi < 0.0 {
+                    return Err(invalid(format!(
+                        "combination_weights[{i}] must be finite and nonnegative, got {wi}"
+                    )));
+                }
+            }
+            let sum: f64 = w.iter().sum();
+            if !sum.is_finite() || sum <= 0.0 {
+                return Err(invalid(format!(
+                    "combination_weights must have a finite, strictly positive sum, got {sum}"
+                )));
+            }
+            w.iter().map(|&wi| wi / sum).collect()
+        }
+    };
+    let mut statistic = 0.0f64;
+    for (&p, &w) in p_values.iter().zip(&normalized) {
+        let clamped = p.clamp(f64::EPSILON, 1.0 - f64::EPSILON);
+        statistic += w * (std::f64::consts::PI * (0.5 - clamped)).tan();
+    }
+    let global_p_value = (0.5 - statistic.atan() / std::f64::consts::PI).clamp(0.0, 1.0);
+    if !statistic.is_finite() || !global_p_value.is_finite() {
+        return Err(invalid(format!(
+            "Cauchy combination produced a non-finite statistic ({statistic}) \
+             or global p-value ({global_p_value})"
+        )));
+    }
+    Ok((global_p_value, statistic))
+}
+
 /// Compare the topological signatures induced by two observed point clouds
 /// `X` and `Y`.
 ///
@@ -1450,14 +1605,31 @@ fn apply_multiple_testing_correction(
 ///
 /// A single root `u64` seed (supplied via `config.random_seed` or drawn from
 /// `OsRng`) drives three independent SplitMix64-derived streams — X sampling,
-/// Y sampling, and one stream per dimension position — so no stream depends
-/// on how many values another consumed, and the same seed and configuration
-/// reproduce identical results. The root seed is always recorded in the
-/// result, even when every per-dimension test used exact inference.
+/// Y sampling, and one stream per homology *degree* (keyed by the degree
+/// itself, not its list position) — so no stream depends on how many values
+/// another consumed, the same seed and configuration reproduce identical
+/// results, and reordering `homology_dimensions` cannot change any
+/// per-dimension test or the combined global value. The root seed is always
+/// recorded in the result, even when every per-dimension test used exact
+/// inference.
 ///
-/// Because one test runs per homology dimension, the raw p-values are
-/// corrected per `config.multiple_testing_correction` (Holm by default);
-/// `reject_null` is computed against the *adjusted* p-values.
+/// The per-dimension tests are **dependent**: the same sampled groups are
+/// reused for every dimension and the underlying Vietoris–Rips complexes are
+/// shared. The raw p-values are therefore combined into `global_p_value`
+/// with `config.combination_method` — [`CombinationMethod::Cauchy`] by
+/// default, an analytic test of the intersection null "equal distributions
+/// in *every* requested dimension" against the alternative "different in at
+/// least one", valid under arbitrary dependence.
+/// [`CombinationMethod::HarmonicMean`] currently returns
+/// [`TopologicalSignatureError::UnsupportedCombinationMethod`] because its
+/// Landau calibration was explicitly deferred;
+/// [`CombinationMethod::JointPermutation`] is likewise reserved pending
+/// shared permutations.
+///
+/// Separately, the raw p-values are corrected per
+/// `config.multiple_testing_correction` (Holm by default) and `reject_null`
+/// is computed against the *adjusted* p-values. This is a per-dimension
+/// compatibility output only — it is **not** the global test.
 ///
 /// A failure to reject is **not** evidence that the two topological
 /// distributions are equal; see `interpretation` in the result.
@@ -1586,7 +1758,7 @@ pub fn topological_signature_test(
     // --- Per-dimension Robinson–Turner tests (caller order) -----------------
     let mut p_values = Vec::with_capacity(config.homology_dimensions.len());
     let mut dimension_results = Vec::with_capacity(config.homology_dimensions.len());
-    for (position, &dim) in config.homology_dimensions.iter().enumerate() {
+    for &dim in &config.homology_dimensions {
         let rt_config = RobinsonTurnerConfig {
             homology_dim: dim,
             max_edge_length: Some(resolved_max_edge_length),
@@ -1595,9 +1767,11 @@ pub fn topological_signature_test(
             max_exact_labelings: config.max_exact_labelings,
             n_permutations: config.n_permutations,
             method: config.method,
+            // Keyed by the homology degree, not the list position, so a
+            // fixed-seed run is invariant under dimension reordering.
             random_seed: Some(derive_stream_seed(
                 root_seed,
-                STREAM_DIMENSION_BASE.wrapping_add(position as u64),
+                STREAM_DIMENSION_BASE.wrapping_add(dim as u64),
             )),
             alpha: config.alpha,
             tie_tolerance: config.tie_tolerance,
@@ -1609,6 +1783,14 @@ pub fn topological_signature_test(
         p_values.push(result.p_value);
         dimension_results.push(result);
     }
+
+    // --- Global combination of the (dependent) per-dimension p-values -----
+    let (global_p_value, global_test_statistic) = combine_p_values(
+        &p_values,
+        config.combination_method,
+        config.combination_weights.as_deref(),
+    )?;
+    let global_reject_null = global_p_value <= config.alpha;
 
     // --- Multiple-testing correction over aligned p-values ------------------
     let adjusted_p_values =
@@ -1648,6 +1830,10 @@ pub fn topological_signature_test(
         sampled_group_sizes: (config.n_samples, config.n_samples),
         sampled_point_counts: (size_x, size_y),
         dimension_results,
+        global_p_value,
+        global_reject_null,
+        global_combination_method: config.combination_method,
+        global_test_statistic,
         interpretation,
     })
 }
@@ -2470,6 +2656,185 @@ mod tests {
         let expected = (d * d + d * d).sqrt();
         for d in &res.dimension_results {
             assert_eq!(d.ph_configuration.max_edge_length, expected);
+        }
+    }
+
+    // --- Global p-value combination ----------------------------------------
+
+    // Constructor defaults: Cauchy combination, no custom weights.
+    #[test]
+    fn signature_config_defaults_cauchy_no_weights() {
+        let cfg = TopologicalSignatureConfig::new(vec![0, 1], 4);
+        assert_eq!(cfg.combination_method, CombinationMethod::Cauchy);
+        assert_eq!(cfg.combination_weights, None);
+    }
+
+    // Cauchy helper reproduces the direct formula on a known vector, and
+    // custom weights are normalized by their sum.
+    #[test]
+    fn combine_cauchy_matches_direct_formula_and_normalizes_weights() {
+        let p = [0.01, 0.5, 0.9];
+        let direct = |w: &[f64]| {
+            let sum: f64 = w.iter().sum();
+            let t: f64 = p
+                .iter()
+                .zip(w)
+                .map(|(&pi, &wi)| (wi / sum) * (std::f64::consts::PI * (0.5 - pi)).tan())
+                .sum();
+            (0.5 - t.atan() / std::f64::consts::PI, t)
+        };
+        let (expected_p, expected_t) = direct(&[1.0, 1.0, 1.0]);
+        let (p_uniform, t_uniform) = combine_p_values(&p, CombinationMethod::Cauchy, None).unwrap();
+        assert_eq!(p_uniform, expected_p);
+        assert_eq!(t_uniform, expected_t);
+
+        // Non-uniform weights [1, 2, 3] must equal the formula with the same
+        // weights normalized — equivalently, scaling weights must not matter.
+        let (p_w, t_w) =
+            combine_p_values(&p, CombinationMethod::Cauchy, Some(&[1.0, 2.0, 3.0])).unwrap();
+        let (expected_p_w, expected_t_w) = direct(&[1.0, 2.0, 3.0]);
+        assert_eq!(p_w, expected_p_w);
+        assert_eq!(t_w, expected_t_w);
+        let (p_w2, t_w2) =
+            combine_p_values(&p, CombinationMethod::Cauchy, Some(&[2.0, 4.0, 6.0])).unwrap();
+        assert_eq!(p_w2, p_w, "proportional weights must normalize identically");
+        assert_eq!(t_w2, t_w);
+    }
+
+    // Exact p = 0 and p = 1 inputs are clamped: finite statistic, bounded
+    // global p, no panic.
+    #[test]
+    fn combine_cauchy_extreme_p_values_stay_finite_and_bounded() {
+        let (p0, t0) = combine_p_values(&[0.0], CombinationMethod::Cauchy, None).unwrap();
+        assert!(t0.is_finite());
+        assert!((0.0..=1.0).contains(&p0));
+        let (p1, t1) = combine_p_values(&[1.0], CombinationMethod::Cauchy, None).unwrap();
+        assert!(t1.is_finite());
+        assert!((0.0..=1.0).contains(&p1));
+        let (pm, _) = combine_p_values(&[0.0, 1.0], CombinationMethod::Cauchy, None).unwrap();
+        assert!((0.0..=1.0).contains(&pm));
+        // Out-of-range / non-finite inputs are InvalidConfig, never panic.
+        for bad in [
+            [-0.1],
+            [1.1],
+            [f64::NAN],
+            [f64::INFINITY],
+            [f64::NEG_INFINITY],
+        ] {
+            assert!(matches!(
+                combine_p_values(&bad, CombinationMethod::Cauchy, None),
+                Err(TopologicalSignatureError::InvalidConfig(_))
+            ));
+        }
+        // Empty input is InvalidConfig.
+        assert!(matches!(
+            combine_p_values(&[], CombinationMethod::Cauchy, None),
+            Err(TopologicalSignatureError::InvalidConfig(_))
+        ));
+    }
+
+    // Invalid custom weights: wrong length, negative, NaN/infinite, and a
+    // zero total each return InvalidConfig.
+    #[test]
+    fn combine_cauchy_rejects_invalid_weights() {
+        let p = [0.2, 0.4];
+        for w in [
+            vec![0.5],                // wrong length
+            vec![0.5, -0.1],          // negative
+            vec![0.5, f64::NAN],      // NaN
+            vec![0.5, f64::INFINITY], // infinite element
+            vec![0.0, 0.0],           // zero total
+        ] {
+            assert!(
+                matches!(
+                    combine_p_values(&p, CombinationMethod::Cauchy, Some(&w)),
+                    Err(TopologicalSignatureError::InvalidConfig(_))
+                ),
+                "weights {w:?} must be rejected"
+            );
+        }
+    }
+
+    // Deferred methods surface the exact structured variant through the
+    // public function (no panic, no silent HMP computation).
+    #[test]
+    fn deferred_combination_methods_return_structured_unsupported() {
+        let (x, y) = signature_inputs();
+        for method in [
+            CombinationMethod::HarmonicMean,
+            CombinationMethod::JointPermutation,
+        ] {
+            let mut cfg = signature_config(&[0]);
+            cfg.combination_method = method;
+            match topological_signature_test(&x, &y, &cfg) {
+                Err(TopologicalSignatureError::UnsupportedCombinationMethod(m)) => {
+                    assert_eq!(m, method)
+                }
+                other => panic!("expected UnsupportedCombinationMethod({method:?}), got {other:?}"),
+            }
+        }
+    }
+
+    // Single dimension: the Cauchy combination of one p-value is that
+    // p-value (within tight floating tolerance).
+    #[test]
+    fn combine_cauchy_single_dimension_recovers_raw_p() {
+        let (x, y) = signature_inputs();
+        let cfg = signature_config(&[1]);
+        let res = topological_signature_test(&x, &y, &cfg).unwrap();
+        assert_eq!(res.p_values.len(), 1);
+        assert!(
+            (res.global_p_value - res.p_values[0]).abs() <= 1e-12,
+            "global p {} must equal raw p {}",
+            res.global_p_value,
+            res.p_values[0]
+        );
+        assert_eq!(res.global_combination_method, CombinationMethod::Cauchy);
+        assert_eq!(res.global_reject_null, res.global_p_value <= res.alpha);
+    }
+
+    // Fixed-seed reproducibility pins the new global fields too.
+    #[test]
+    fn signature_fixed_seed_reproduces_global_fields() {
+        let (x, y) = signature_inputs();
+        let cfg = signature_config(&[0, 1]);
+        let r1 = topological_signature_test(&x, &y, &cfg).unwrap();
+        let r2 = topological_signature_test(&x, &y, &cfg).unwrap();
+        assert_eq!(r1.global_p_value, r2.global_p_value);
+        assert_eq!(r1.global_test_statistic, r2.global_test_statistic);
+        assert_eq!(r1.global_reject_null, r2.global_reject_null);
+        assert_eq!(r1.global_combination_method, r2.global_combination_method);
+        assert_eq!(r1, r2);
+    }
+
+    // Deterministic null-calibration sanity check: under perfect dependence
+    // (same p twice), the combined p must equal p itself, so the empirical
+    // rejection proportion on a uniform midpoint grid cannot exceed the
+    // nominal level (up to floating tolerance).
+    #[test]
+    fn combine_cauchy_perfect_dependence_is_calibrated() {
+        let n = 1000usize;
+        let mut reject_counts = [0usize; 3];
+        let alphas = [0.01, 0.05, 0.1];
+        for i in 0..n {
+            let p = (i as f64 + 0.5) / n as f64;
+            let (global, _) = combine_p_values(&[p, p], CombinationMethod::Cauchy, None).unwrap();
+            assert!(
+                (global - p).abs() <= 1e-12,
+                "perfectly dependent duplicate must recover p: global {global} vs {p}"
+            );
+            for (k, &a) in alphas.iter().enumerate() {
+                if global <= a {
+                    reject_counts[k] += 1;
+                }
+            }
+        }
+        for (k, &a) in alphas.iter().enumerate() {
+            let prop = reject_counts[k] as f64 / n as f64;
+            assert!(
+                prop <= a + 1e-12,
+                "rejection proportion {prop} exceeds nominal {a} under perfect dependence"
+            );
         }
     }
 }
