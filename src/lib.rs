@@ -101,6 +101,10 @@ use oxicuda_tda::persistence::diagram::PersistenceDiagram;
 use oxicuda_tda::persistence::distance::bottleneck_distance;
 use oxicuda_tda::persistence::wasserstein_p::wasserstein_p;
 
+/// Synthetic dataset generators (point clouds sampled from manifolds and other
+/// structured spaces).
+pub mod datasets;
+
 /// Version string of the exactly-pinned `oxicuda-tda` backend.
 const BACKEND_NAME: &str = "oxicuda-tda";
 const BACKEND_VERSION: &str = "0.5.5";

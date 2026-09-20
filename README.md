@@ -142,6 +142,50 @@ under the configured sampling / filtration / metric / test pipeline. It is
 that the two distributions are equal**. The `random_seed` used (given or
 generated) is recorded in the result; replaying it reproduces the full run.
 
+## Synthetic manifold examples
+
+The synthetic dataset generators can be used directly with
+`topological_signature_test`. Two runnable examples compare independently
+sampled point clouds from spheres, tori, and Klein bottles:
+
+```text
+cargo run --example compare_same_manifolds
+cargo run --example compare_distinct_manifolds
+```
+
+Both examples use fixed seeds, `H1`, exact permutation inference, and
+`EssentialClassPolicy::Drop` to censor classes still alive at the cut-off.
+`compare_same_manifolds` samples 1,000 source points per cloud and draws 10
+resampled clouds of 40 points per group; `compare_distinct_manifolds` samples
+100 source points per cloud and draws 6 resampled clouds of 40 points per
+group. Both omit `max_edge_length` (constructor default `None`), so for each
+comparison the cut-off is resolved automatically as the maximum internal
+Euclidean diameter of the two source clouds and recorded in
+`ph_configuration.max_edge_length`.
+
+The deterministic runs produce:
+
+| Comparison | Adjusted H1 p-value | Automatic cutoff | Reject at 0.05? |
+| --- | ---: | ---: | :---: |
+| Sphere vs. sphere | 0.673310 | 1.999999 | No |
+| Torus vs. torus | 0.784408 | 1.999756 | No |
+| Klein bottle vs. Klein bottle | 0.812163 | 2.118385 | No |
+| Sphere vs. torus | 0.002165 | 1.999911 | Yes |
+| Sphere vs. Klein bottle | 0.006494 | 2.096112 | Yes |
+| Torus vs. Klein bottle | 0.857143 | 2.096112 | No |
+
+These runs found no evidence against exchangeability of the configured `H1`
+signatures for four of the six pairs, and rejections for sphere vs. torus and
+sphere vs. Klein bottle at `alpha = 0.05`. Neither direction should be
+over-read: rejection is evidence about the configured sampling / filtration /
+metric / test pipeline, not a certificate that the manifolds differ
+topologically, and non-rejection is not proof of equality. Power and outcomes
+depend on the finite samples, resampling size, the (here automatically
+resolved) filtration cut-off, censoring policy, and homology dimensions;
+automatic cutoff selection does not resolve the pseudoreplication limitation
+of this resampling design. The values above are reproducible usage examples, not
+benchmark results.
+
 ## What the test claims (and what it does not)
 
 *Null hypothesis.* Conditional on the configured point-cloud-to-diagram
