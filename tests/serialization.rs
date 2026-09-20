@@ -26,7 +26,8 @@ fn tiny_groups() -> (Vec<PointCloud>, Vec<PointCloud>) {
 }
 
 fn base_config() -> RobinsonTurnerConfig {
-    let mut cfg = RobinsonTurnerConfig::new(1, 4.0);
+    let mut cfg = RobinsonTurnerConfig::new(1);
+    cfg.max_edge_length = Some(4.0);
     cfg.method = InferenceMethod::Exact;
     cfg.random_seed = Some(1);
     cfg.essential_class_policy = EssentialClassPolicy::Drop;
@@ -109,7 +110,8 @@ fn signature_result_serializes_via_serde_json() {
     let x = square(1.0);
     let y =
         PointCloud::try_from_rows(vec![vec![0.0, 0.0], vec![0.2, 0.0], vec![0.4, 0.0]]).unwrap();
-    let mut cfg = TopologicalSignatureConfig::new(vec![0], 2, 4.0);
+    let mut cfg = TopologicalSignatureConfig::new(vec![0], 2);
+    cfg.max_edge_length = Some(4.0);
     cfg.method = InferenceMethod::Exact;
     cfg.random_seed = Some(1);
     cfg.essential_class_policy = EssentialClassPolicy::Drop;

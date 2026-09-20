@@ -72,7 +72,8 @@
 //!     vec![0.0, 0.0], vec![0.2, 0.0], vec![0.0, 0.2], vec![0.2, 0.2],
 //! ]).unwrap();
 //!
-//! let config = RobinsonTurnerConfig::new(1, 1.5); // homology_dim, max_edge_length
+//! let mut config = RobinsonTurnerConfig::new(1); // homology_dim
+//! config.max_edge_length = Some(1.5); // explicit filtration cut-off
 //! let result = robinson_turner_two_sample_test(
 //!     &[square, square2],
 //!     &[blob, blob2],
@@ -203,16 +204,19 @@ pub enum EssentialClassPolicy {
 
 /// Configuration for [`robinson_turner_two_sample_test`].
 ///
-/// `homology_dim` and `max_edge_length` have no scientifically universal
-/// defaults; construct with [`RobinsonTurnerConfig::new`]. [`Default`] uses
-/// `homology_dim = 1` and `max_edge_length = 1.0` purely as mechanical
-/// placeholders — scientific callers should use `new`.
+/// `homology_dim` has no scientifically universal default; construct with
+/// [`RobinsonTurnerConfig::new`]. [`Default`] uses `homology_dim = 1` purely
+/// as a mechanical placeholder — scientific callers should use `new`.
 #[derive(Clone, Debug)]
 pub struct RobinsonTurnerConfig {
     /// Requested homology degree `k`; must be `<= 5` (backend filtration limit).
     pub homology_dim: usize,
-    /// Finite, strictly positive Rips truncation (max edge length).
-    pub max_edge_length: f64,
+    /// Rips truncation (max edge length). `None` (the default) resolves it
+    /// automatically as the maximum within-cloud Euclidean diameter over the
+    /// supplied clouds; `Some(value)` must be finite and strictly positive and
+    /// is the cost-bounding override. Automatic mode is scale-dependent, costs
+    /// `O(sum n_i^2 d)` over clouds, and may create dense complexes.
+    pub max_edge_length: Option<f64>,
     /// Diagram-distance order `p`.
     pub diagram_distance: DiagramDistance,
     /// Loss exponent `q in {1, 2}` (default 2 → `F_{p,2}`).
@@ -239,25 +243,25 @@ pub struct RobinsonTurnerConfig {
 }
 
 impl RobinsonTurnerConfig {
-    /// Create a configuration with the two required scientific choices; all
-    /// other fields take the documented defaults of [`Default`].
-    pub fn new(homology_dim: usize, max_edge_length: f64) -> Self {
+    /// Create a configuration with the required scientific choice; the
+    /// filtration cutoff defaults to `None` (automatic within-cloud diameter)
+    /// and all other fields take the documented defaults of [`Default`].
+    pub fn new(homology_dim: usize) -> Self {
         Self {
             homology_dim,
-            max_edge_length,
             ..Self::default()
         }
     }
 }
 
 impl Default for RobinsonTurnerConfig {
-    /// Mechanical defaults only — `homology_dim = 1` and
-    /// `max_edge_length = 1.0` are placeholders; scientific callers should use
-    /// [`RobinsonTurnerConfig::new`].
+    /// Mechanical defaults only — `homology_dim = 1` is a placeholder and
+    /// `max_edge_length = None` selects automatic resolution; scientific
+    /// callers should use [`RobinsonTurnerConfig::new`].
     fn default() -> Self {
         Self {
             homology_dim: 1,
-            max_edge_length: 1.0,
+            max_edge_length: None,
             diagram_distance: DiagramDistance::Wasserstein2,
             loss_q: 2,
             max_exact_labelings: 1_000_000,
@@ -518,6 +522,58 @@ fn validate_cloud(cloud: &PointCloud, index: usize) -> Result<(), RobinsonTurner
     Ok(())
 }
 
+/// Resolve the effective Rips truncation. An explicit `Some` is validated and
+/// returned immediately without scanning the clouds. `None` computes each
+/// cloud's internal Euclidean diameter (never distances between points of
+/// different clouds) and returns the maximum; zero or non-finite results are
+/// rejected because the backend requires a finite, strictly positive cutoff.
+/// Callers must pass already-validated clouds.
+fn resolve_max_edge_length<'a>(
+    clouds: impl IntoIterator<Item = &'a PointCloud>,
+    configured: Option<f64>,
+) -> Result<f64, String> {
+    if let Some(value) = configured {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!(
+                "max_edge_length must be finite and strictly positive, got {value}"
+            ));
+        }
+        return Ok(value);
+    }
+
+    let mut diameter = 0.0_f64;
+    for cloud in clouds {
+        for i in 0..cloud.n_points {
+            let a = &cloud.coordinates[i * cloud.ambient_dim..(i + 1) * cloud.ambient_dim];
+            for j in (i + 1)..cloud.n_points {
+                let b = &cloud.coordinates[j * cloud.ambient_dim..(j + 1) * cloud.ambient_dim];
+                // Backend-identical Euclidean distance (oxicuda-tda 0.5.5
+                // computes sqrt(sum_d((x_d - y_d)^2)) in coordinate order), so
+                // the resolved diameter edge is never rounded away by the
+                // filtration itself.
+                let squared_distance = a.iter().zip(b).fold(0.0_f64, |sum, (&x, &y)| {
+                    let difference = x - y;
+                    sum + difference * difference
+                });
+                let distance = squared_distance.sqrt();
+                if !distance.is_finite() {
+                    return Err(
+                        "automatic max_edge_length is non-finite for the supplied data".to_string(),
+                    );
+                }
+                diameter = diameter.max(distance);
+            }
+        }
+    }
+    if diameter <= 0.0 {
+        return Err(
+            "automatic max_edge_length is zero; supply Some(value) for singleton or coincident data"
+                .to_string(),
+        );
+    }
+    Ok(diameter)
+}
+
 /// `C(n, k)` with checked `u128` arithmetic; `None` on overflow.
 fn checked_binomial(n: usize, k: usize) -> Option<u128> {
     let k = k.min(n.checked_sub(k)?);
@@ -540,6 +596,7 @@ fn cloud_to_diagram(
     cloud: &PointCloud,
     index: usize,
     config: &RobinsonTurnerConfig,
+    max_edge_length: f64,
 ) -> Result<(PersistenceDiagram, usize), RobinsonTurnerError> {
     // oxicuda-tda 0.5.5 panics inside `vietoris_rips` when `max_dim + 1`
     // exceeds the point count (it seeds subset enumeration with `(0..size)`
@@ -551,7 +608,7 @@ fn cloud_to_diagram(
     let filtration = Filtration::vietoris_rips_from_points(
         &cloud.coordinates,
         cloud.ambient_dim,
-        config.max_edge_length,
+        max_edge_length,
         max_simplex_dim,
     )
     .map_err(backend_err)?;
@@ -910,7 +967,9 @@ pub mod __test_seams {
 ///
 /// Each cloud independently yields exactly one degree-`config.homology_dim`
 /// diagram (Euclidean Vietoris–Rips through simplex dimension `k + 1`,
-/// truncated at `config.max_edge_length`, coefficients in `Z/2`). The
+/// truncated at the effective `config.max_edge_length` (explicit `Some` or
+/// the resolved maximum within-cloud diameter for `None`), coefficients in
+/// `Z/2`). The
 /// `N x N` optimal diagram-distance matrix is built once and reused for every
 /// labeling; permutations act at cloud level only.
 ///
@@ -961,12 +1020,8 @@ pub fn robinson_turner_two_sample_test(
             config.homology_dim
         )));
     }
-    if !config.max_edge_length.is_finite() || config.max_edge_length <= 0.0 {
-        return Err(RobinsonTurnerError::InvalidConfig(format!(
-            "max_edge_length must be finite and strictly positive, got {}",
-            config.max_edge_length
-        )));
-    }
+    let max_edge_length = resolve_max_edge_length(pooled.iter().copied(), config.max_edge_length)
+        .map_err(RobinsonTurnerError::InvalidConfig)?;
     if config.loss_q != 1 && config.loss_q != 2 {
         return Err(RobinsonTurnerError::InvalidConfig(format!(
             "loss_q must be 1 or 2, got {}",
@@ -998,7 +1053,7 @@ pub fn robinson_turner_two_sample_test(
     let mut diagrams = Vec::with_capacity(n);
     let mut dropped = Vec::with_capacity(n);
     for (i, c) in pooled.iter().enumerate() {
-        let (d, n_essential) = cloud_to_diagram(c, i, config)?;
+        let (d, n_essential) = cloud_to_diagram(c, i, config, max_edge_length)?;
         diagrams.push(d);
         dropped.push(n_essential);
     }
@@ -1147,7 +1202,7 @@ pub fn robinson_turner_two_sample_test(
         backend_version: BACKEND_VERSION.to_string(),
         ph_configuration: PhConfiguration {
             homology_dim: config.homology_dim,
-            max_edge_length: config.max_edge_length,
+            max_edge_length,
             max_simplex_dim: config.homology_dim + 1,
             coefficient_field: "Z/2".to_string(),
             filtration: "Vietoris-Rips (Euclidean)".to_string(),
@@ -1183,7 +1238,7 @@ pub enum MultipleTestingCorrection {
 
 /// Configuration for [`topological_signature_test`].
 ///
-/// `homology_dimensions`, `n_samples`, and `max_edge_length` have no
+/// `homology_dimensions` and `n_samples` have no
 /// scientifically universal defaults; construct with
 /// [`TopologicalSignatureConfig::new`]. All fields shared with
 /// [`RobinsonTurnerConfig`] take the same documented defaults as
@@ -1200,8 +1255,13 @@ pub struct TopologicalSignatureConfig {
     /// Point count of every sampled cloud; `None` reuses each input's own
     /// `n_points` (X clouds get `x.n_points`, Y clouds get `y.n_points`).
     pub sampled_cloud_size: Option<usize>,
-    /// Finite, strictly positive Rips truncation (max edge length).
-    pub max_edge_length: f64,
+    /// Rips truncation (max edge length). `None` (the default) resolves it
+    /// automatically as the maximum within-cloud Euclidean diameter of the
+    /// two input clouds, shared by every dimension and sampled cloud;
+    /// `Some(value)` must be finite and strictly positive and is the
+    /// cost-bounding override. Automatic mode is scale-dependent, costs
+    /// `O(sum n_i^2 d)`, and may create dense complexes.
+    pub max_edge_length: Option<f64>,
     /// Diagram-distance order `p`.
     pub diagram_distance: DiagramDistance,
     /// Loss exponent `q in {1, 2}` (default 2 → `F_{p,2}`).
@@ -1233,16 +1293,17 @@ pub struct TopologicalSignatureConfig {
 }
 
 impl TopologicalSignatureConfig {
-    /// Create a configuration with the three required scientific choices; all
-    /// other fields take the documented defaults shared with
+    /// Create a configuration with the required scientific choices; the
+    /// filtration cutoff defaults to `None` (automatic within-cloud diameter)
+    /// and all other fields take the documented defaults shared with
     /// [`RobinsonTurnerConfig::new`], plus `sampled_cloud_size = None` and
     /// `multiple_testing_correction = Holm`.
-    pub fn new(homology_dimensions: Vec<usize>, n_samples: usize, max_edge_length: f64) -> Self {
+    pub fn new(homology_dimensions: Vec<usize>, n_samples: usize) -> Self {
         Self {
             homology_dimensions,
             n_samples,
             sampled_cloud_size: None,
-            max_edge_length,
+            max_edge_length: None,
             diagram_distance: DiagramDistance::Wasserstein2,
             loss_q: 2,
             max_exact_labelings: 1_000_000,
@@ -1442,12 +1503,11 @@ pub fn topological_signature_test(
             "sampled_cloud_size must be nonzero when set".to_string(),
         ));
     }
-    if !config.max_edge_length.is_finite() || config.max_edge_length <= 0.0 {
-        return Err(invalid(format!(
-            "max_edge_length must be finite and strictly positive, got {}",
-            config.max_edge_length
-        )));
-    }
+    // Resolve once against the validated original inputs so every dimension
+    // and sampled cloud shares the same effective cutoff and the lower-level
+    // test never rescans.
+    let resolved_max_edge_length = resolve_max_edge_length([x, y], config.max_edge_length)
+        .map_err(TopologicalSignatureError::InvalidConfig)?;
     if config.loss_q != 1 && config.loss_q != 2 {
         return Err(invalid(format!(
             "loss_q must be 1 or 2, got {}",
@@ -1525,7 +1585,7 @@ pub fn topological_signature_test(
     for (position, &dim) in config.homology_dimensions.iter().enumerate() {
         let rt_config = RobinsonTurnerConfig {
             homology_dim: dim,
-            max_edge_length: config.max_edge_length,
+            max_edge_length: Some(resolved_max_edge_length),
             diagram_distance: config.diagram_distance,
             loss_q: config.loss_q,
             max_exact_labelings: config.max_exact_labelings,
@@ -1771,7 +1831,8 @@ mod tests {
             tiny_cloud(&[&[0.0, 0.0], &[2.9, 0.1], &[0.1, 3.0]]),
             tiny_cloud(&[&[0.0, 0.1], &[3.1, 0.0], &[0.0, 2.9]]),
         ];
-        let mut cfg = RobinsonTurnerConfig::new(1, 4.0);
+        let mut cfg = RobinsonTurnerConfig::new(1);
+        cfg.max_edge_length = Some(4.0);
         cfg.method = InferenceMethod::MonteCarlo;
         cfg.n_permutations = 200;
         cfg.random_seed = Some(42);
@@ -1787,7 +1848,11 @@ mod tests {
     #[test]
     fn validation_matrix() {
         let c = || tiny_cloud(&[&[0.0, 0.0], &[1.0, 0.0]]);
-        let good = RobinsonTurnerConfig::new(0, 2.0);
+        let good = {
+            let mut c = RobinsonTurnerConfig::new(0);
+            c.max_edge_length = Some(2.0);
+            c
+        };
         // Small groups.
         assert!(matches!(
             robinson_turner_two_sample_test(&[c()], &[c(), c()], &good),
@@ -1848,7 +1913,7 @@ mod tests {
         // Edge length: zero, negative, NaN, infinite.
         for v in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let mut bad = good.clone();
-            bad.max_edge_length = v;
+            bad.max_edge_length = Some(v);
             assert!(matches!(
                 robinson_turner_two_sample_test(&[c(), c()], &[c(), c()], &bad),
                 Err(RobinsonTurnerError::InvalidConfig(_))
@@ -1908,7 +1973,8 @@ mod tests {
     fn essential_policy() {
         let a = [c2(0.0), c2(0.1)];
         let b = [c2(1.0), c2(1.1)];
-        let mut cfg = RobinsonTurnerConfig::new(0, 2.0);
+        let mut cfg = RobinsonTurnerConfig::new(0);
+        cfg.max_edge_length = Some(2.0);
         let err = robinson_turner_two_sample_test(&a, &b, &cfg);
         assert!(matches!(
             err,
@@ -1975,7 +2041,8 @@ mod tests {
         __test_seams::reset_pairwise_distance_calls();
         let a = [c2(0.0), c2(0.1), c2(0.2)];
         let b = [c2(1.0), c2(1.1), c2(1.2)];
-        let mut cfg = RobinsonTurnerConfig::new(0, 2.0);
+        let mut cfg = RobinsonTurnerConfig::new(0);
+        cfg.max_edge_length = Some(2.0);
         cfg.essential_class_policy = EssentialClassPolicy::Drop;
         cfg.return_distance_matrix = true;
         let res = robinson_turner_two_sample_test(&a, &b, &cfg).unwrap();
@@ -2005,7 +2072,8 @@ mod tests {
     }
 
     fn signature_config(dims: &[usize]) -> TopologicalSignatureConfig {
-        let mut cfg = TopologicalSignatureConfig::new(dims.to_vec(), 2, 2.0);
+        let mut cfg = TopologicalSignatureConfig::new(dims.to_vec(), 2);
+        cfg.max_edge_length = Some(2.0);
         cfg.essential_class_policy = EssentialClassPolicy::Drop;
         cfg.method = InferenceMethod::Exact;
         cfg.random_seed = Some(1234);
@@ -2145,7 +2213,7 @@ mod tests {
         // Mirrored scalar checks.
         for v in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let mut bad = good.clone();
-            bad.max_edge_length = v;
+            bad.max_edge_length = Some(v);
             assert!(matches!(
                 topological_signature_test(&x, &y, &bad),
                 Err(TopologicalSignatureError::InvalidConfig(_))
@@ -2221,7 +2289,11 @@ mod tests {
         );
         // Lower-level path rejects it too.
         let c = || tiny_cloud(&[&[0.0, 0.0], &[1.0, 0.0]]);
-        let rt_cfg = RobinsonTurnerConfig::new(0, 2.0);
+        let rt_cfg = {
+            let mut c = RobinsonTurnerConfig::new(0);
+            c.max_edge_length = Some(2.0);
+            c
+        };
         let res2 = robinson_turner_two_sample_test(&[huge, c()], &[c(), c()], &rt_cfg);
         assert!(
             matches!(res2, Err(RobinsonTurnerError::MalformedCloud { .. })),
@@ -2241,5 +2313,159 @@ mod tests {
             matches!(res, Err(TopologicalSignatureError::InvalidConfig(_))),
             "expected InvalidConfig, got {res:?}"
         );
+    }
+
+    // --- Automatic max_edge_length resolution -----------------------------
+
+    /// Group-A clouds with within-cloud diameter 1 and group-B clouds with
+    /// diameter 2 (each group duplicated to meet the two-cloud minimum).
+    fn diameter_groups() -> (Vec<PointCloud>, Vec<PointCloud>) {
+        let d1 = || tiny_cloud(&[&[0.0, 0.0], &[1.0, 0.0]]);
+        let d2 = || tiny_cloud(&[&[0.0, 0.0], &[2.0, 0.0]]);
+        (vec![d1(), d1()], vec![d2(), d2()])
+    }
+
+    fn drop_policy_config() -> RobinsonTurnerConfig {
+        let mut cfg = RobinsonTurnerConfig::new(0);
+        cfg.essential_class_policy = EssentialClassPolicy::Drop;
+        cfg
+    }
+
+    // None resolves to the maximum within-cloud diameter (max(1, 2) = 2) and
+    // records it in PhConfiguration.
+    #[test]
+    fn automatic_cutoff_resolves_max_within_cloud_diameter() {
+        let (a, b) = diameter_groups();
+        let cfg = drop_policy_config();
+        assert_eq!(cfg.max_edge_length, None);
+        let res = robinson_turner_two_sample_test(&a, &b, &cfg).unwrap();
+        assert_eq!(res.ph_configuration.max_edge_length, 2.0);
+    }
+
+    // Some(1.25) is used verbatim even though the data diameter is 2.
+    #[test]
+    fn explicit_cutoff_overrides_automatic_diameter() {
+        let (a, b) = diameter_groups();
+        let mut cfg = drop_policy_config();
+        cfg.max_edge_length = Some(1.25);
+        let res = robinson_turner_two_sample_test(&a, &b, &cfg).unwrap();
+        assert_eq!(res.ph_configuration.max_edge_length, 1.25);
+    }
+
+    // Translating one whole cloud arbitrarily far away cannot enlarge the
+    // automatic cutoff, proving no cross-cloud distances are measured.
+    #[test]
+    fn automatic_cutoff_ignores_cross_cloud_translation() {
+        let (a, mut b) = diameter_groups();
+        for x in b[0].coordinates.iter_mut() {
+            *x += 1.0e9;
+        }
+        let cfg = drop_policy_config();
+        let res = robinson_turner_two_sample_test(&a, &b, &cfg).unwrap();
+        assert_eq!(res.ph_configuration.max_edge_length, 2.0);
+    }
+
+    // All singleton / coincident clouds give a zero diameter: a structured
+    // InvalidConfig, not a backend failure.
+    #[test]
+    fn automatic_cutoff_zero_diameter_is_invalid_config() {
+        let singleton = || tiny_cloud(&[&[1.0, 1.0]]);
+        let coincident = || tiny_cloud(&[&[1.0, 1.0], &[1.0, 1.0]]);
+        let cfg = drop_policy_config();
+        for (a, b) in [
+            (
+                vec![singleton(), singleton()],
+                vec![singleton(), singleton()],
+            ),
+            (
+                vec![coincident(), coincident()],
+                vec![singleton(), coincident()],
+            ),
+        ] {
+            match robinson_turner_two_sample_test(&a, &b, &cfg) {
+                Err(RobinsonTurnerError::InvalidConfig(msg)) => {
+                    assert!(msg.contains("automatic max_edge_length is zero"), "{msg}")
+                }
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+        }
+    }
+
+    // Finite coordinates whose pairwise difference overflows to infinity must
+    // fail automatic resolution instead of passing a non-finite cutoff on.
+    #[test]
+    fn automatic_cutoff_nonfinite_diameter_is_invalid_config() {
+        let extreme = || tiny_cloud(&[&[-1.0e308], &[1.0e308]]);
+        let normal = || tiny_cloud(&[&[0.0], &[1.0]]);
+        let cfg = drop_policy_config();
+        match robinson_turner_two_sample_test(&[extreme(), normal()], &[normal(), normal()], &cfg) {
+            Err(RobinsonTurnerError::InvalidConfig(msg)) => {
+                assert!(
+                    msg.contains("automatic max_edge_length is non-finite"),
+                    "{msg}"
+                )
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    // Explicit Some values keep the legacy invalid-config rejection in both
+    // public entry points.
+    #[test]
+    fn explicit_cutoff_invalid_values_rejected_in_both_entry_points() {
+        let (a, b) = diameter_groups();
+        let (x, y) = signature_inputs();
+        for v in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut rt = drop_policy_config();
+            rt.max_edge_length = Some(v);
+            match robinson_turner_two_sample_test(&a, &b, &rt) {
+                Err(RobinsonTurnerError::InvalidConfig(msg)) => {
+                    assert!(msg.contains("finite and strictly positive"), "{msg}")
+                }
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+            let mut ts = signature_config(&[0]);
+            ts.max_edge_length = Some(v);
+            match topological_signature_test(&x, &y, &ts) {
+                Err(TopologicalSignatureError::InvalidConfig(msg)) => {
+                    assert!(msg.contains("finite and strictly positive"), "{msg}")
+                }
+                other => panic!("expected InvalidConfig, got {other:?}"),
+            }
+        }
+    }
+
+    // Regression: for a non-axis-aligned diameter pair the recorded cutoff
+    // must equal the backend's sqrt(sum of squared differences) bit-for-bit,
+    // so the nominal diameter edge is included by the filtration.
+    #[test]
+    fn automatic_cutoff_matches_backend_distance_arithmetic() {
+        let diagonal = || tiny_cloud(&[&[0.0, 0.0], &[0.1, 0.1]]);
+        let small = || tiny_cloud(&[&[0.0, 0.0], &[0.05, 0.0]]);
+        let cfg = drop_policy_config();
+        let res =
+            robinson_turner_two_sample_test(&[diagonal(), diagonal()], &[small(), small()], &cfg)
+                .unwrap();
+        let expected = ((0.1_f64 * 0.1) + (0.1_f64 * 0.1)).sqrt();
+        assert_eq!(res.ph_configuration.max_edge_length, expected);
+    }
+
+    // Topological-signature automatic mode resolves once from [x, y] and
+    // records the same cutoff in every per-dimension result.
+    #[test]
+    fn signature_automatic_cutoff_shared_across_dimensions() {
+        let (x, y) = signature_inputs();
+        let mut cfg = signature_config(&[0, 1]);
+        cfg.max_edge_length = None;
+        let res = topological_signature_test(&x, &y, &cfg).unwrap();
+        // Both inputs' diameters are diagonal pairs; the binding one is y's
+        // (3,3)-(3.1,3.1) pair, whose coordinate difference is not exactly
+        // 0.1. Compute the reference with the backend's literal arithmetic
+        // on the actual input coordinates.
+        let d = 3.0_f64 - 3.1;
+        let expected = (d * d + d * d).sqrt();
+        for d in &res.dimension_results {
+            assert_eq!(d.ph_configuration.max_edge_length, expected);
+        }
     }
 }

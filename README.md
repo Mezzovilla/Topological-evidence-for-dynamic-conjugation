@@ -42,8 +42,10 @@ let group_b: Vec<PointCloud> = [0.0_f64, 0.05, -0.05]
     })
     .collect();
 
-// homology_dim = 1 (loops), max_edge_length = 2.0 (filtration cut-off).
-let mut config = RobinsonTurnerConfig::new(1, 2.0);
+// homology_dim = 1 (loops); explicit filtration cut-off of 2.0
+// (None — the default — uses the maximum within-cloud diameter instead).
+let mut config = RobinsonTurnerConfig::new(1);
+config.max_edge_length = Some(2.0);
 config.diagram_distance = DiagramDistance::Wasserstein2;
 config.method = InferenceMethod::MonteCarlo;
 config.n_permutations = 999;
@@ -98,7 +100,8 @@ let y = PointCloud::try_from_rows(vec![
 ])
 .unwrap();
 
-let mut config = TopologicalSignatureConfig::new(vec![0, 1], 8, 2.5);
+let mut config = TopologicalSignatureConfig::new(vec![0, 1], 8);
+config.max_edge_length = Some(2.5);
 config.method = InferenceMethod::MonteCarlo;
 config.n_permutations = 999;
 config.random_seed = Some(42); // deterministic run; None uses OsRng
@@ -215,8 +218,12 @@ reproducible on the same supported crate versions and target.
 
 ## Finite filtrations and essential classes
 
-The Rips filtration is truncated at `max_edge_length` (finite, strictly
-positive) and built through simplex dimension `k + 1`. A `k`-dimensional class
+The Rips filtration is truncated at `max_edge_length` and built through
+simplex dimension `k + 1`. `max_edge_length` is an `Option<f64>`: `None` (the
+default) resolves it automatically as the maximum within-cloud Euclidean
+diameter of the supplied clouds — scale-dependent, `O(sum n_i^2 d)` over
+clouds, and potentially a dense complex — while `Some(value)` (finite,
+strictly positive) is the cost-bounding override. A `k`-dimensional class
 still alive at the cut-off is *essential* for this analysis — its death time
 is unknown. `EssentialClassPolicy::Reject` (default) returns a structured
 error; `EssentialClassPolicy::Drop` explicitly censors those classes and

@@ -65,7 +65,8 @@ fn noisy_two_circles(rng: &mut Rng, n_each: usize, noise: f64) -> PointCloud {
 }
 
 fn mc_config(seed: u64, permutations: u64) -> RobinsonTurnerConfig {
-    let mut cfg = RobinsonTurnerConfig::new(1, 4.0);
+    let mut cfg = RobinsonTurnerConfig::new(1);
+    cfg.max_edge_length = Some(4.0);
     cfg.method = InferenceMethod::MonteCarlo;
     cfg.n_permutations = permutations;
     cfg.random_seed = Some(seed);
@@ -209,10 +210,11 @@ fn uniform_scaling_changes_statistic_not_scale_invariant() {
         })
         .collect();
 
-    let mut cfg = RobinsonTurnerConfig::new(1, 4.0);
+    let mut cfg = RobinsonTurnerConfig::new(1);
+    cfg.max_edge_length = Some(4.0);
     cfg.method = InferenceMethod::Exact;
     let r1 = robinson_turner_two_sample_test(&group_a, &group_b, &cfg).unwrap();
-    cfg.max_edge_length = 4.0 * scale;
+    cfg.max_edge_length = Some(4.0 * scale);
     let r2 = robinson_turner_two_sample_test(&scaled_a, &scaled_b, &cfg).unwrap();
 
     assert!(r1.statistic > 0.0);

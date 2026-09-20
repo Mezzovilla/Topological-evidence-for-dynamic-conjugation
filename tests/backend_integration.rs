@@ -48,7 +48,8 @@ fn triple() -> PointCloud {
 }
 
 fn base_config(homology_dim: usize, max_edge_length: f64) -> RobinsonTurnerConfig {
-    let mut cfg = RobinsonTurnerConfig::new(homology_dim, max_edge_length);
+    let mut cfg = RobinsonTurnerConfig::new(homology_dim);
+    cfg.max_edge_length = Some(max_edge_length);
     cfg.method = InferenceMethod::Exact;
     cfg.return_distance_matrix = true;
     cfg.random_seed = Some(7);

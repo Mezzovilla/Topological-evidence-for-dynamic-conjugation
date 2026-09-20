@@ -28,7 +28,8 @@ fn readme_example_runs() {
         .collect();
 
     // homology_dim = 1 (loops), max_edge_length = 2.0 (filtration cut-off).
-    let mut config = RobinsonTurnerConfig::new(1, 2.0);
+    let mut config = RobinsonTurnerConfig::new(1);
+    config.max_edge_length = Some(2.0);
     config.diagram_distance = DiagramDistance::Wasserstein2;
     config.method = InferenceMethod::MonteCarlo;
     config.n_permutations = 999;

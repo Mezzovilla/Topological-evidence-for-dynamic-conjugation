@@ -45,7 +45,8 @@ fn segment_cloud() -> PointCloud {
 /// `Drop` is set globally: it is required for H0 (one component always
 /// survives a finite filtration) and is inert for higher dimensions.
 fn config(dims: Vec<usize>, n: usize, seed: Option<u64>) -> TopologicalSignatureConfig {
-    let mut cfg = TopologicalSignatureConfig::new(dims, n, 2.5);
+    let mut cfg = TopologicalSignatureConfig::new(dims, n);
+    cfg.max_edge_length = Some(2.5);
     cfg.method = InferenceMethod::Exact;
     cfg.max_exact_labelings = 100_000;
     cfg.random_seed = seed;
@@ -120,7 +121,8 @@ fn recorded_generated_seed_replays_full_result() {
 
 #[test]
 fn holm_is_default_and_adjusted_p_values_dominate_raw() {
-    let cfg = TopologicalSignatureConfig::new(vec![0, 1], 4, 2.5);
+    let mut cfg = TopologicalSignatureConfig::new(vec![0, 1], 4);
+    cfg.max_edge_length = Some(2.5);
     assert_eq!(
         cfg.multiple_testing_correction,
         MultipleTestingCorrection::Holm,
@@ -169,7 +171,8 @@ fn readme_example_shape_compiles_and_succeeds() {
         vec![1.2, 0.0],
     ]);
 
-    let mut config = TopologicalSignatureConfig::new(vec![0, 1], 8, 2.5);
+    let mut config = TopologicalSignatureConfig::new(vec![0, 1], 8);
+    config.max_edge_length = Some(2.5);
     config.method = InferenceMethod::MonteCarlo;
     config.n_permutations = 999;
     config.random_seed = Some(42);
@@ -206,7 +209,8 @@ fn robinson_turner_two_sample_test_still_works_standalone() {
         cloud(vec![vec![0.0, 0.0], vec![0.3, 0.0], vec![0.6, 0.0]]),
         cloud(vec![vec![0.0, 0.0], vec![0.4, 0.0], vec![0.8, 0.0]]),
     ];
-    let mut cfg = RobinsonTurnerConfig::new(1, 2.5);
+    let mut cfg = RobinsonTurnerConfig::new(1);
+    cfg.max_edge_length = Some(2.5);
     cfg.method = InferenceMethod::Exact;
 
     let result = robinson_turner_two_sample_test(&group_a, &group_b, &cfg)
